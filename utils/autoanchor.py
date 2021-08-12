@@ -31,6 +31,11 @@ def check_anchors(dataset, model, thr=4.0, imgsz=640):
     wh = torch.tensor(np.concatenate([l[:, 3:5] * s for s, l in zip(shapes * scale, dataset.labels)])).float()  # wh
 
     def metric(k):  # compute metric
+        """
+        图片的wh/anchor的wh (N, 2, 1) / (N, 2, 1) = (N, 2, 1)
+        找到最小的长宽比(最不像正方形的) x : (N, 2)
+        若基本都在大于1/4,则不改变.
+        """
         r = wh[:, None] / k[None]
         x = torch.min(r, 1. / r).min(2)[0]  # ratio metric
         best = x.max(1)[0]  # best_x

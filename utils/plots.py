@@ -79,6 +79,13 @@ def plot_one_box(x, im, color=(128, 128, 128), label=None, line_thickness=3):
         cv2.putText(im, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
 
 
+def plot_one_points(x, im, color=(128, 128, 128), label=None, line_thickness=3):
+    # Plots one bounding box on image 'im' using OpenCV
+    assert im.data.contiguous, 'Image not contiguous. Apply np.ascontiguousarray(im) to plot_on_box() input image.'
+    tl = line_thickness or round(0.002 * (im.shape[0] + im.shape[1]) / 2) + 1  # line/font thickness
+    cv2.circle(im, (int((x[0] + x[2]) / 2), int((x[1] + x[3]) / 2)), 2, color, thickness=tl, lineType=cv2.LINE_AA)
+
+
 def plot_one_box_PIL(box, im, color=(128, 128, 128), label=None, line_thickness=None):
     # Plots one bounding box on image 'im' using PIL
     im = Image.fromarray(im)
@@ -288,12 +295,12 @@ def plot_labels(labels, names=(), save_dir=Path('')):
     nc = int(c.max() + 1)  # number of classes
     x = pd.DataFrame(b.transpose(), columns=['x', 'y', 'width', 'height'])
 
-    # seaborn correlogram
+    # seaborn correlogram 显示'x', 'y', 'width', 'height' 之间的关系
     sn.pairplot(x, corner=True, diag_kind='auto', kind='hist', diag_kws=dict(bins=50), plot_kws=dict(pmax=0.9))
     plt.savefig(save_dir / 'labels_correlogram.jpg', dpi=200)
     plt.close()
 
-    # matplotlib labels
+    # matplotlib labels 左上角为类别的分布图
     matplotlib.use('svg')  # faster
     ax = plt.subplots(2, 2, figsize=(8, 8), tight_layout=True)[1].ravel()
     y = ax[0].hist(c, bins=np.linspace(0, nc, nc + 1) - 0.5, rwidth=0.8)
@@ -307,7 +314,7 @@ def plot_labels(labels, names=(), save_dir=Path('')):
     sn.histplot(x, x='x', y='y', ax=ax[2], bins=50, pmax=0.9)
     sn.histplot(x, x='width', y='height', ax=ax[3], bins=50, pmax=0.9)
 
-    # rectangles
+    # rectangles 框都归一化到中心点, 显示框的形状
     labels[:, 1:3] = 0.5  # center
     labels[:, 1:] = xywh2xyxy(labels[:, 1:]) * 2000
     img = Image.fromarray(np.ones((2000, 2000, 3), dtype=np.uint8) * 255)

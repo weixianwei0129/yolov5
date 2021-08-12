@@ -64,7 +64,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     w.mkdir(parents=True, exist_ok=True)  # make dir
     last, best = w / 'last.pt', w / 'best.pt'
 
-    # Hyperparameters
+    # Hyper parameters
     if isinstance(hyp, str):
         with open(hyp) as f:
             hyp = yaml.safe_load(f)  # load hyps dict
@@ -89,6 +89,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         for k in methods(loggers):
             callbacks.register_action(k, callback=getattr(loggers, k))
 
+    """ 配置:  运行设备, 训练集路径, 验证集路径, 类别数量, 类别名称"""
     # Config
     plots = not evolve  # create plots
     cuda = device.type != 'cpu'
@@ -101,6 +102,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     assert len(names) == nc, f'{len(names)} names found for nc={nc} dataset in {data}'  # check
     is_coco = data.endswith('coco.yaml') and nc == 80  # COCO dataset
 
+    """构建模型, 加载预训练模型"""
     # Model
     pretrained = weights.endswith('.pt')
     if pretrained:
@@ -116,6 +118,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
 
+    """冻结部分参数, 不进行更新 opt.freeze"""
     # Freeze
     freeze = [f'model.{x}.' for x in range(freeze)]  # layers to freeze
     for k, v in model.named_parameters():
@@ -124,12 +127,16 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             print(f'freezing {k}')
             v.requires_grad = False
 
+    """构建优化器: 重新计算batch size, 计算每次batch的权重衰减系数;
+    分组梯度: bias(g2) batchNorm(g0) weight(g1), 对不同组参数使用不同的学习率等参数, 设置每组学习率的变化.
+    """
     # Optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
     LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
+    # todo 为什么这样分组???
     g0, g1, g2 = [], [], []  # optimizer parameter groups
     for v in model.modules():
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias
@@ -150,16 +157,17 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 f"{len(g0)} weight, {len(g1)} weight (no decay), {len(g2)} bias")
     del g0, g1, g2
 
-    # Scheduler
+    # Scheduler 对每组的参数做处理
     if opt.linear_lr:
         lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
     else:
         lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
-    # EMA
+    # EMA 计算模型的Smooth Moving Average
     ema = ModelEMA(model) if RANK in [-1, 0] else None
 
+    """断点训练: 加载预训练模型, 加载EMA值, 加载训练的epoch"""
     # Resume
     start_epoch, best_fitness = 0, 0.0
     if pretrained:
@@ -183,11 +191,17 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
         del ckpt, csd
 
+    """分析图片尺寸在模型中的变化, 设置anchor
+    gs: 下采样倍率, 最小32倍.
+    nl: 特征层数
+    imgsz: gs的整数倍, 向上取整.
+    """
     # Image sizes
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     nl = model.model[-1].nl  # number of detection layers (used for scaling hyp['obj'])
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
 
+    """多gpu训练"""
     # DP mode
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:
         logging.warning('DP not recommended, instead use torch.distributed.run for best DDP Multi-GPU results.\n'
@@ -199,7 +213,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info('Using SyncBatchNorm()')
 
-    # Trainloader
+    """加载训练数据: loader, dataset, 
+    mlc: 最大标签类, max label class, 其中labels: cls_index, cx, cy, w, h
+    nb: number of batches
+    nc: number of classes
+    """
+    # Train Loader
     train_loader, dataset = create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
                                               hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect, rank=RANK,
                                               workers=workers, image_weights=opt.image_weights, quad=opt.quad,
@@ -208,6 +227,10 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     nb = len(train_loader)  # number of batches
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
+    """分析训练数据: 
+    分析x,y,w,h的关系和分布
+    分析anchor设置是否合理, 若不合理则基于KMeans聚类计算anchor尺寸
+    """
     # Process 0
     if RANK in [-1, 0]:
         val_loader = create_dataloader(val_path, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls,
@@ -234,6 +257,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     if cuda and RANK != -1:
         model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
 
+    """设置多任务loss中各个任务loss的权重
+    这里 '3' 表示标注的yolo使用的是3层的特征层. 
+    '80' 表示原始的yolo使用的是80个分类.
+    '640' 表示原始yolo使用的是640的尺寸.
+    """
     # Model parameters
     hyp['box'] *= 3. / nl  # scale to layers
     hyp['cls'] *= nc / 80. * 3. / nl  # scale to classes and layers
@@ -244,6 +272,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
+    """开始训练!!!
+    设置热启动次数, 重置指标, 开始循环.
+    """
     # Start training
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
@@ -313,6 +344,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # Forward
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
+                """计算loss!!"""
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
@@ -428,8 +460,8 @@ def parse_opt(known=False):
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--noval', action='store_true', help='only validate final epoch')
-    parser.add_argument('--noautoanchor', action='store_true', help='disable autoanchor check')
-    parser.add_argument('--evolve', type=int, nargs='?', const=300, help='evolve hyperparameters for x generations')
+    parser.add_argument('--noautoanchor', action='store_true', help='disable auto-anchor check')
+    parser.add_argument('--evolve', type=int, nargs='?', const=300, help='evolve hyper-parameters for x generations')
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache', type=str, nargs='?', const='ram', help='--cache images in "ram" (default) or "disk"')
     parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')

@@ -879,6 +879,7 @@ def verify_image_label(args):
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
                     l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
                 l = np.array(l, dtype=np.float32)
+            l = abs(l)
             if len(l):
                 assert l.shape[1] == 5, 'labels require 5 columns each'
                 assert (l >= 0).all(), 'negative labels'
